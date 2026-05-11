@@ -26,9 +26,9 @@ export const CONTRACTS = {
   },
   pairs: {
     WETH_USDC: {
-      escrow: "0x1E28f3b232959a8358bB2F2244dF39044C095886",
-      matcher: "0x3Fbd69B3730Efc0252DC49f425F966Cb710db14A",
-      settlement: "0xA2b44f6BC5B616FFDE4a4A51E86DE65B0e997d72",
+      escrow: "0x442a2E462D0c417c921C2BBaEF7ed493d4b53696",
+      matcher: "0x120ba9675F1a4aC8c71CD2aC1e8CF7BFFf24b869",
+      settlement: "0x91BC5dF8c2FBE7557641ECe2500fd3c59A76aBA4",
     },
     WETH_LINK: {
       escrow: "0x3f191313e064416aE8f96f69b22E208334664553",

@@ -9,11 +9,18 @@ const ESCROW_ABI = [
   "event OrderCancelled(uint256 indexed orderId, address indexed trader)",
   "function cTokenA() view returns (address)",
   "function cTokenB() view returns (address)",
+  "function activeSellOrderId() view returns (uint256)",
+  "function activeBuyOrderId() view returns (uint256)",
+  "function nextOrderId() view returns (uint256)",
   "function submitSellOrder(bytes32 encMinPrice, bytes priceProof, bytes32 encSellSize, bytes sizeProof) returns (uint256)",
   "function submitBuyOrder(bytes32 encBidPrice, bytes priceProof, bytes32 encBuySize, bytes sizeProof) returns (uint256)",
   "function cancelOrder(uint256 orderId)",
   "function orders(uint256) view returns (uint256 id, address trader, uint8 side, bytes32 encPrice, bytes32 encSize, uint8 status, uint64 createdAt)",
 ] as const;
+
+const ACL_ERROR_IFACE = new ethers.Interface([
+  "error ACLNotAllowed(bytes32 handle, address account)",
+]);
 
 const MATCHER_ABI = [
   "event MatchRequested(uint256 indexed requestId, uint256 indexed sellOrderId, uint256 indexed buyOrderId)",
@@ -87,15 +94,12 @@ function getEthereum(): ethers.Eip1193Provider | null {
 }
 
 export function getBrowserProvider(): ethers.BrowserProvider {
-  if (typeof window === "undefined") throw new Error("SSR: no browser provider");
   const eth = getEthereum();
   if (!eth) throw new Error("No injected wallet found");
   return new ethers.BrowserProvider(eth);
 }
 
 export function getRpcProvider(): ethers.JsonRpcProvider {
-    if (typeof window === "undefined") throw new Error("SSR: no RPC provider");
-
   const rpc = (import.meta as ImportMeta & { env?: Record<string, string> }).env?.VITE_SEPOLIA_RPC_URL
     || "https://ethereum-sepolia-rpc.publicnode.com";
   return new ethers.JsonRpcProvider(rpc, 11155111);
@@ -120,6 +124,72 @@ async function queryFilterChunked(
 
 export function getEscrowContract(pairKey: PairKey, signerOrProvider: ethers.Signer | ethers.Provider) {
   return new ethers.Contract(CONTRACTS.pairs[pairKey].escrow, ESCROW_ABI, signerOrProvider);
+}
+
+function extractHexData(err: any): string | null {
+  const values = [
+    err?.data,
+    err?.revert?.data,
+    err?.error?.data,
+    err?.info?.error?.data,
+    err?.receipt?.revertReason,
+  ];
+  for (const v of values) {
+    if (typeof v === "string" && v.startsWith("0x")) return v;
+  }
+  return null;
+}
+
+export async function explainSubmitFailure(args: { pairKey: PairKey; side: Side; error: unknown }) {
+  const e = args.error as any;
+  const message = String(e?.message ?? "unknown");
+  const data = extractHexData(e);
+  if (!data) return null;
+
+  try {
+    const parsed = ACL_ERROR_IFACE.parseError(data);
+    if (parsed?.name === "ACLNotAllowed") {
+      const blockedHandle = String(parsed.args[0]);
+      const blockedAddress = String(parsed.args[1]).toLowerCase();
+      const expectedMatcher = CONTRACTS.pairs[args.pairKey].matcher.toLowerCase();
+      let note = "";
+      if (blockedAddress === expectedMatcher) {
+        const provider = getRpcProvider();
+        const escrow = getEscrowContract(args.pairKey, provider);
+        const [sellId, buyId] = await Promise.all([
+          escrow.activeSellOrderId(),
+          escrow.activeBuyOrderId(),
+        ]);
+        const oppositeHeadId = args.side === "Sell" ? buyId : sellId;
+        if (oppositeHeadId > 0n) {
+          const opposite = await escrow.orders(oppositeHeadId);
+          note =
+            ` Opposite head order #${oppositeHeadId.toString()} (trader ${String(opposite.trader)}) ` +
+            "is likely using a ciphertext not ACL-authorized for the current matcher.";
+        }
+      }
+      return {
+        code: "ACL_NOT_ALLOWED",
+        blockedHandle,
+        blockedAddress,
+        userMessage:
+          `Submit failed: matcher is not allowed to process a required encrypted handle (${blockedHandle.slice(0, 12)}...).` +
+          note,
+      } as const;
+    }
+  } catch {
+    // ignore parse failures
+  }
+
+  if (message.includes("0x5ff91cdc")) {
+    return {
+      code: "ZERO_CONFIDENTIAL_BALANCE",
+      userMessage:
+        "Submit failed: zero confidential balance for required funding token (ERC7984ZeroBalance). Wrap/fund this side first.",
+    } as const;
+  }
+
+  return null;
 }
 
 export async function submitEncryptedOrder(args: {
@@ -175,7 +245,14 @@ export async function getFundingStatus(args: {
   owner: string;
   signer?: ethers.Signer;
 }) {
-  const provider = getRpcProvider();
+  let provider: ethers.Provider;
+  try {
+    const browser = getBrowserProvider();
+    await browser.getNetwork();
+    provider = browser;
+  } catch {
+    provider = getRpcProvider();
+  }
   const u = new ethers.Contract(args.underlyingToken, ERC20_ABI, provider);
   const cRead = new ethers.Contract(
     args.cToken,
@@ -226,7 +303,14 @@ export async function getFundingContractsForPair(args: {
   pairKey: PairKey;
   side: Side;
 }): Promise<{ cToken: string; underlyingToken: string }> {
-  const provider = getRpcProvider();
+  let provider: ethers.Provider;
+  try {
+    const browser = getBrowserProvider();
+    await browser.getNetwork();
+    provider = browser;
+  } catch {
+    provider = getRpcProvider();
+  }
   const escrow = getEscrowContract(args.pairKey, provider);
   // Funding token is what trader pays in UI semantics.
   // Standard orientation: cTokenA=base and cTokenB=quote.
@@ -459,6 +543,45 @@ export async function fetchOrdersForAddress(address: string, pairKeys: PairKey[]
         }
       }),
     );
+
+    // Fallback reconciliation: scan on-chain order storage directly for this trader.
+    // This surfaces orders that may be missing from event indexing windows/provider inconsistencies.
+    let nextOrderId = 0n;
+    try {
+      nextOrderId = await escrow.nextOrderId();
+    } catch {
+      nextOrderId = 0n;
+    }
+    const lowerBound = nextOrderId > 500n ? nextOrderId - 500n : 1n;
+    const existing = new Set(rows.filter((r) => r.pairKey === pairKey).map((r) => `${r.pairKey}:${r.orderId}`));
+    for (let id = lowerBound; id < nextOrderId; id++) {
+      try {
+        const order = await escrow.orders(id);
+        const trader = String(order.trader);
+        if (trader.toLowerCase() !== normalized) continue;
+        const orderId = id.toString();
+        if (existing.has(`${pairKey}:${orderId}`)) continue;
+        const rawSide = Number(order.side);
+        const side: Side =
+          rawSide === 0
+            ? (invertSideForUi ? "Buy" : "Sell")
+            : (invertSideForUi ? "Sell" : "Buy");
+        const createdAtMs = Number(order.createdAt) * 1000;
+        rows.push({
+          orderId,
+          pairKey,
+          pairLabel,
+          side,
+          trader,
+          txHash: "0x",
+          blockNumber: 0,
+          timestamp: createdAtMs > 0 ? createdAtMs : Date.now(),
+          status: mapOrderStatus(Number(order.status)),
+        });
+      } catch {
+        // ignore sparse/malformed rows
+      }
+    }
   }
 
   await Promise.all(

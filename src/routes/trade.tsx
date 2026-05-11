@@ -8,6 +8,7 @@ import {
   type Side,
   approveConfidentialForEscrow,
   approveUnderlyingForWrapper,
+  explainSubmitFailure,
   getBrowserProvider,
   getFundingContractsForPair,
   getFundingStatus,
@@ -30,6 +31,7 @@ function Trade() {
   const [fundAmount, setFundAmount] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [refreshingFunding, setRefreshingFunding] = useState(false);
   const [fundingInfo, setFundingInfo] = useState<any>(null);
   const [fundingError, setFundingError] = useState<string | null>(null);
   const [fundingTarget, setFundingTarget] = useState<{ cToken: string; underlyingToken: string } | null>(null);
@@ -58,9 +60,8 @@ function Trade() {
   }
 
   async function refreshFundingInfo() {
-      if (typeof window === "undefined") return;  // <-- add this line
-
     if (!pair) return;
+    setRefreshingFunding(true);
     try {
       setFundingError(null);
       const provider = getBrowserProvider();
@@ -104,6 +105,9 @@ function Trade() {
       const msg = e?.message ?? "status read failed";
       setFundingError(msg);
       setFundingInfo(null);
+      setStatus(`✕ Funding status failed: ${msg}`);
+    } finally {
+      setRefreshingFunding(false);
     }
   }
 
@@ -169,22 +173,19 @@ function Trade() {
       });
       setStatus(`✓ Submitted: ${res.txHash}`);
     } catch (e: any) {
-      const msg = String(e?.message ?? "unknown");
-      if (msg.includes("0x5ff91cdc")) {
-        setStatus("✕ Submit failed: zero confidential balance for required funding token (ERC7984ZeroBalance). Wrap and fund the token used for this side first.");
-      } else {
-        setStatus(`✕ Submit failed: ${msg}`);
-      }
+      const decoded = await explainSubmitFailure({ pairKey: pair.key as PairKey, side, error: e });
+      if (decoded) setStatus(`✕ ${decoded.userMessage}`);
+      else setStatus(`✕ Submit failed: ${String(e?.message ?? "unknown")}`);
     } finally {
       setSubmitting(false);
     }
   }
 
-useEffect(() => {
-  if (typeof window === "undefined") return;
-  setFundingTokenSymbol(null);
-  refreshFundingInfo();
-}, [pairId, side]);
+  useEffect(() => {
+    setFundingTokenSymbol(null);
+    refreshFundingInfo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pairId, side]);
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8">
@@ -221,7 +222,7 @@ useEffect(() => {
           <div className="flex items-center justify-between"><span className="text-muted-foreground">Confidential Balance Handle</span><span className="font-mono">{fundingInfo?.confidentialBalanceHandle?.slice(0, 12) ?? "—"}...</span></div>
           <div className="flex items-center justify-between"><span className="text-muted-foreground">Escrow Permission</span><span>{fundingInfo ? (fundingInfo.escrowOperatorEnabled ? "Enabled" : "Not enabled") : "—"}</span></div>
           {fundingError && <div className="mt-2 text-xs text-destructive">status read failed: {fundingError}</div>}
-          <button type="button" onClick={refreshFundingInfo} className="mt-3 w-full rounded border border-border px-3 py-2 text-[10px] uppercase tracking-[0.2em] hover:border-primary hover:text-primary">Refresh Funding Status</button>
+          <button type="button" onClick={refreshFundingInfo} disabled={refreshingFunding} className="mt-3 w-full rounded border border-border px-3 py-2 text-[10px] uppercase tracking-[0.2em] hover:border-primary hover:text-primary disabled:opacity-60">{refreshingFunding ? "Refreshing..." : "Refresh Funding Status"}</button>
         </div>
 
         <input value={price} onChange={(e) => setPrice(e.target.value)} placeholder="Price" className="w-full rounded border border-border bg-background px-3 py-3 text-base placeholder:text-muted-foreground/40" />
